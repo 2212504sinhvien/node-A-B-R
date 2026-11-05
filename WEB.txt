@@ -1,0 +1,2434 @@
+import sys
+import re
+import csv
+import json
+import time
+import datetime
+import threading
+from collections import deque
+ 
+BAUDRATE     = 115200
+CSV_FILE     = "log.csv"
+HOST         = "0.0.0.0"
+PORT         = 5000
+MAX_LOG_ROWS = 200
+MAX_CHART_PTS = 100
+ 
+RX_RE           = re.compile(r'\[RX #(\d+)\] "(.*)"')
+SRC_RE          = re.compile(r'src=(\S+)\s+hop=(\d+)\s+seq=(\d+)')
+RSSI_RE         = re.compile(r'RSSI:\s*(-?[\d.]+)\s*dBm\s*\|\s*SNR:\s*(-?[\d.]+)\s*dB')
+ALARM_RE        = re.compile(r'\[CANH BAO\] NHAN BAO DONG TU NODE (\S+)')
+ALARM_RSSI_RE   = re.compile(r'RSSI\s*(-?[\d.]+)\s*dBm\s*\|\s*SNR\s*(-?[\d.]+)\s*dB')
+CLEAR_RE        = re.compile(r'\[SOS\] Node (\S+) DA HUY bao dong')
+TX_RE           = re.compile(r'\[TX #(\d+)\] GUI: "(.*)"')
+TXOK_RE         = re.compile(r'-> \[OK\] ACK, RTT (\d+) ms')
+TXFAIL_RE       = re.compile(r'-> \[FAIL\] khong nhan duoc ACK')
+ALARMTX_RE      = re.compile(r'\[SOS\] Phat bao dong lan (\d+) seq=(\d+)')
+ 
+ALARMTXCLEAR_RE = re.compile(r'\[SOS\] NODE (\S+) DA HUY BAO DONG')
+ 
+CFG_RE          = re.compile(
+    r'\[CFG\]\s+node=(\S+)\s+sf=(\d+)\s+bw=([\d.]+)\s+cr=4/(\d+)'
+    r'\s+freq=([\d.]+)\s+pwr=(\d+)\s+rep=(\d)')
+ 
+class State:
+    def __init__(self):
+        self.lock = threading.Lock()
+        self.n_rx = 0
+        self.n_tx_ok = 0
+        self.n_tx_fail = 0
+        self.n_alarm = 0
+        self.n_alarm_tx = 0
+        self.n_clear = 0
+        self.last_rssi = None
+        self.last_snr = None
+        self.last_rtt = None
+        self.alarm_active = False
+        self.alarm_src = None
+        self.alarm_ts = None
+        self.logs = deque(maxlen=MAX_LOG_ROWS)
+        self.chart_data = deque(maxlen=MAX_CHART_PTS)
+ 
+        self.seq_nguon = {}
+        self.n_lost = 0
+        self.n_expected = 0
+ 
+        self.cfg_node = None
+        self.cfg_sf   = None
+        self.cfg_bw   = None
+        self.cfg_cr   = None
+        self.cfg_freq = None
+        self.cfg_pwr  = None
+        self.cfg_rep  = None
+ 
+state = State()
+ 
+def ghi_nhan_seq(src, seq):
+    if seq is None or seq == "" or src in (None, ""):
+        return 0
+    try:
+        s = int(seq)
+    except (TypeError, ValueError):
+        return 0
+ 
+    rec = state.seq_nguon.get(src)
+    if rec is None:
+ 
+        state.seq_nguon[src] = {"min": s, "max": s, "seen": {s}}
+        _tinh_lai_tong()
+        return 0
+ 
+    if rec["max"] >= 8 and s < rec["max"] // 4:
+        state.seq_nguon[src] = {"min": s, "max": s, "seen": {s}}
+        _tinh_lai_tong()
+        return 0
+ 
+    if s in rec["seen"]:
+        _tinh_lai_tong()
+        return 0
+ 
+    rec["seen"].add(s)
+    if s < rec["min"]:
+        rec["min"] = s
+    if s > rec["max"]:
+        rec["max"] = s
+ 
+    return _tinh_lai_tong()
+ 
+def _tinh_lai_tong():
+    truoc = state.n_lost
+    du_kien = 0
+    da_nhan = 0
+    for r in state.seq_nguon.values():
+        du_kien += (r["max"] - r["min"] + 1)
+        da_nhan += len(r["seen"])
+    state.n_expected = du_kien
+    state.n_lost = max(0, du_kien - da_nhan)
+    return max(0, state.n_lost - truoc)
+ 
+def tinh_pdr():
+    if state.n_expected <= 0:
+        return None
+    return (state.n_expected - state.n_lost) / state.n_expected * 100.0
+ 
+def tach_du_lieu_do():
+    from collections import defaultdict
+    theo_moc = defaultdict(lambda: {"rssi": [], "snr": [],
+                                    "n_msg": 0, "tx": 0, "ok": 0,
+                                    "fail": 0, "hop1": 0})
+    theo_rssi = []
+    for r in nhat_ky.rows:
+ 
+        if r.get("bo_qua") not in ("", None):
+            continue
+        kc = r.get("khoang_cach")
+        if kc in ("", None):
+            continue
+        try:
+            k = int(float(kc))
+        except (TypeError, ValueError):
+            continue
+        t = r["loai"]
+        d = theo_moc[k]
+        if t == "msg":
+            d["n_msg"] += 1
+            if r["rssi"] not in ("", None):
+                try:
+                    rr = float(r["rssi"])
+                    d["rssi"].append(rr)
+                    theo_rssi.append(rr)
+                except ValueError:
+                    pass
+            if r["snr"] not in ("", None):
+                try:
+                    d["snr"].append(float(r["snr"]))
+                except ValueError:
+                    pass
+            try:
+                if int(float(r.get("hop") or 0)) >= 1:
+                    d["hop1"] += 1
+            except (TypeError, ValueError):
+                pass
+        elif t == "tx":
+            d["tx"] += 1
+        elif t == "tx_ok":
+            d["ok"] += 1
+        elif t == "tx_fail":
+            d["fail"] += 1
+    return dict(theo_moc), theo_rssi
+ 
+def hoi_quy_path_loss():
+    import math
+    theo_moc, _ = tach_du_lieu_do()
+ 
+    diem = []
+    for k in sorted(theo_moc):
+        v = theo_moc[k]["rssi"]
+        if v:
+            diem.append((k, sum(v) / len(v), len(v)))
+    if len(diem) < 2:
+        return {"ok": False,
+                "loi": "Cần ít nhất 2 mốc khoảng cách có dữ liệu RSSI "
+                       "(hiện có %d). Hãy đo và chốt mốc trước." % len(diem)}
+ 
+    xs = [math.log10(d) for d, _, _ in diem]
+    ys = [r for _, r, _ in diem]
+    nn = len(xs)
+    sx, sy = sum(xs), sum(ys)
+    sxx = sum(x * x for x in xs)
+    sxy = sum(x * y for x, y in zip(xs, ys))
+    den = nn * sxx - sx * sx
+    if abs(den) < 1e-9:
+        return {"ok": False, "loi": "Các mốc khoảng cách quá gần nhau, "
+                                    "không hồi quy được."}
+    a = (nn * sxy - sx * sy) / den
+    b = (sy - a * sx) / nn
+    n = -a / 10.0
+ 
+    resid = [y - (a * x + b) for x, y in zip(xs, ys)]
+    mres = sum(resid) / nn
+    sigma = math.sqrt(sum((r - mres) ** 2 for r in resid) / nn) if nn > 1 else 0.0
+ 
+    ytb = sy / nn
+    ss_tot = sum((y - ytb) ** 2 for y in ys)
+    ss_res = sum((y - (a * x + b)) ** 2 for x, y in zip(xs, ys))
+    r2 = 1 - ss_res / ss_tot if ss_tot > 1e-9 else 1.0
+ 
+    moc_kep = []
+    for i in range(1, len(diem)):
+        d_truoc, r_truoc, _ = diem[i - 1]
+        d_sau, r_sau, _ = diem[i]
+        if r_sau > r_truoc + 0.5:
+            moc_kep.append(d_sau)
+ 
+    return {"ok": True, "A": round(b, 2), "n": round(n, 2),
+            "sigma": round(sigma, 2), "r2": round(r2, 3),
+            "diem": diem, "moc_kep": moc_kep}
+ 
+def thong_ke_pdr_theo_rssi(bin_db=3):
+ 
+    from collections import defaultdict
+    _, theo_rssi = tach_du_lieu_do()
+    if not theo_rssi:
+        return []
+    lo = int(min(theo_rssi))
+    hi = int(max(theo_rssi))
+ 
+    lo = (lo // bin_db) * bin_db
+    bins = defaultdict(int)
+    for r in theo_rssi:
+        b = (int(r) // bin_db) * bin_db
+        bins[b] += 1
+    out = []
+    for b in sorted(bins):
+        out.append((b, b + bin_db, bins[b]))
+    return out
+ 
+EVENT_INFO = {
+    "msg":          ("Nhận tin nhắn",    "Nhận"),
+    "alarm":        ("Nhận báo động",    "Nhận"),
+    "alarm_repeat": ("Báo động lặp lại", "Nhận"),
+    "clear":        ("Hủy báo động",     "Nhận"),
+    "tx":           ("Gửi tin nhắn",     "Gửi"),
+    "tx_ok":        ("Gửi thành công",   "Gửi"),
+    "tx_fail":      ("Gửi thất bại",     "Gửi"),
+    "alarm_tx":     ("Phát báo động",    "Gửi"),
+    "marker":       ("Chốt mốc đo",      "Mốc"),
+}
+ 
+def mo_ta_su_kien(t):
+    return EVENT_INFO.get(t, (t, ""))
+ 
+def xep_loai_link(rssi):
+    if rssi is None or rssi == "":
+        return ""
+    try:
+        r = float(rssi)
+    except (TypeError, ValueError):
+        return ""
+    if r >= -90:
+        return "Tốt"
+    if r >= -110:
+        return "Trung bình"
+    if r >= -125:
+        return "Yếu"
+    return "Rất yếu"
+ 
+def ghi_chu_su_kien(ev):
+    t = ev.get("type", "")
+    if t == "tx_ok":
+        return "Đã nhận ACK từ nút đích"
+    if t == "tx_fail":
+        return "Không nhận được ACK sau khi thử lại"
+    if t == "alarm":
+        return "Nút %s đang phát báo động khẩn cấp" % ev.get("src", "?")
+    if t == "alarm_tx":
+        return "Trạm cổng tự phát báo động (lần %s)" % ev.get("attempt", "?")
+    if t == "clear":
+        return "Nút %s đã hủy báo động" % ev.get("src", "?")
+    if t == "msg":
+        hop = ev.get("hop", "")
+        if hop in (0, "0"):
+            return "Liên lạc trực tiếp"
+        if hop not in ("", None):
+            return "Qua %s trạm chuyển tiếp" % hop
+    if t == "marker":
+        return "Mốc %s m — bắt đầu đo" % (ev.get("text") or "?")
+    return ""
+ 
+def _fmt_num(v, nd=1):
+    if v is None or v == "":
+        return ""
+    try:
+        return round(float(v), nd)
+    except (TypeError, ValueError):
+        return ""
+ 
+def _fmt(v, nd=1):
+    if v is None or v == "":
+        return ""
+    try:
+        return ("%%.%df" % nd) % float(v)
+    except (TypeError, ValueError):
+        return str(v)
+ 
+CSV_HEADER = [
+    "STT", "Ngày", "Giờ", "Khoảng cách (m)", "SF", "Sự kiện", "Chiều",
+    "Nguồn", "Nội dung", "RSSI (dBm)", "SNR (dB)", "Chất lượng liên kết",
+    "Số chặng", "Seq", "RTT đầy đủ (ms)", "Ghi chú", "Bỏ qua",
+]
+ 
+KHOANG_CACH_HIEN_TAI = 0
+ 
+def dat_khoang_cach(m):
+    global KHOANG_CACH_HIEN_TAI
+    try:
+        v = int(float(m))
+    except (TypeError, ValueError):
+        return KHOANG_CACH_HIEN_TAI
+    if v < 0:
+        v = 0
+    KHOANG_CACH_HIEN_TAI = v
+    luu_khoang_cach(v)
+    return v
+ 
+def khoang_cach_hien_tai():
+    return KHOANG_CACH_HIEN_TAI
+ 
+KC_FILE = "khoang_cach.txt"
+ 
+def luu_khoang_cach(v):
+    try:
+        with open(KC_FILE, "w", encoding="utf-8") as f:
+            f.write(str(v))
+    except OSError:
+        pass
+ 
+def nap_khoang_cach():
+    import os
+    global KHOANG_CACH_HIEN_TAI
+    if not os.path.isfile(KC_FILE):
+        return 0
+    try:
+        with open(KC_FILE, "r", encoding="utf-8") as f:
+            v = int(float(f.read().strip() or "0"))
+    except (OSError, ValueError):
+        return 0
+    if v < 0:
+        v = 0
+    KHOANG_CACH_HIEN_TAI = v
+    return v
+ 
+DATE_FMT = "%d/%m/%Y"
+TIME_FMT = "%H:%M:%S"
+ 
+EVENT_FILL = {
+    "msg":          "E8F1FB",
+    "tx":           "F2F2F2",
+    "tx_ok":        "DFF5DF",
+    "tx_fail":      "FBE0E0",
+    "alarm":        "FBD5D5",
+    "alarm_repeat": "FCE8E8",
+    "alarm_tx":     "F6C7C7",
+    "clear":        "E4F7E4",
+    "marker":       "D6E4F5",
+}
+ 
+class NhatKy:
+ 
+    def __init__(self):
+        self.rows = []
+        self.stt = 0
+ 
+    def them(self, ev):
+        self.stt += 1
+        now = datetime.datetime.now()
+        t = ev.get("type", "")
+        ten, chieu = mo_ta_su_kien(t)
+        rssi = ev.get("rssi", "")
+ 
+        _src = ev.get("src", "")
+        if t == "msg" and _src:
+            _nguon_hien = "%s→B" % _src
+        elif t == "tx":
+            _nguon_hien = "B→A"
+        else:
+            _nguon_hien = _src
+        self.rows.append({
+            "stt": self.stt,
+            "ngay": now.strftime(DATE_FMT),
+            "gio": now.strftime(TIME_FMT),
+ 
+            "khoang_cach": (khoang_cach_hien_tai()
+                            if khoang_cach_hien_tai() > 0 else ""),
+            "sf": state.cfg_sf if state.cfg_sf else "",
+            "loai": t,
+            "su_kien": ten,
+            "chieu": chieu,
+            "nguon": _nguon_hien,
+            "noi_dung": ev.get("text", ""),
+            "rssi": _fmt_num(rssi),
+            "snr": _fmt_num(ev.get("snr", "")),
+            "chat_luong": xep_loai_link(rssi),
+            "hop": _fmt_num(ev.get("hop", ""), 0),
+            "seq": _fmt_num(ev.get("seq", ""), 0),
+            "rtt": _fmt_num(ev.get("rtt_ms", ""), 0),
+            "ghi_chu": ghi_chu_su_kien(ev),
+ 
+            "bo_qua": ev.get("bo_qua", ""),
+        })
+        return self.rows[-1]
+ 
+nhat_ky = NhatKy()
+ 
+class CsvWriter:
+ 
+    def __init__(self, path):
+        self.path = path
+        self._locked_warned = False
+        self._chuan_bi_file()
+ 
+    def _chuan_bi_file(self):
+        import os
+        can_tao = True
+        if os.path.isfile(self.path):
+            try:
+ 
+                with open(self.path, "r", encoding="utf-8-sig") as f:
+                    hdr = f.readline().strip()
+                if hdr and hdr.split(",")[0].strip().strip('"') == CSV_HEADER[0]:
+                    can_tao = False
+                else:
+ 
+                    old = self.path.replace(
+                        ".csv",
+                        "_cu_" + datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+                        + ".csv")
+                    try:
+                        os.rename(self.path, old)
+                        print("  [i] log.csv dinh dang cu -> luu tai %s"
+                              % os.path.basename(old))
+                    except OSError:
+                        pass
+            except (PermissionError, OSError):
+                print("  [!] log.csv dang bi mo trong Excel - dong lai de ghi.")
+        if can_tao:
+            try:
+                with open(self.path, "w", encoding="utf-8-sig", newline="") as f:
+                    csv.writer(f).writerow(CSV_HEADER)
+            except PermissionError:
+                print("  [!] log.csv dang bi mo trong Excel - dong lai de ghi.")
+ 
+    def write(self, rec):
+        row = [rec["stt"], rec["ngay"], rec["gio"], rec["khoang_cach"],
+               rec["sf"], rec["su_kien"], rec["chieu"], rec["nguon"],
+               rec["noi_dung"], rec["rssi"], rec["snr"], rec["chat_luong"],
+               rec["hop"], rec["seq"], rec["rtt"], rec["ghi_chu"],
+               rec.get("bo_qua", "")]
+        try:
+            with open(self.path, "a", encoding="utf-8-sig", newline="") as f:
+                csv.writer(f).writerow(row)
+            self._locked_warned = False
+        except PermissionError:
+            if not self._locked_warned:
+                print("  [!] log.csv bi khoa (Excel dang mo?). Dashboard van chay.")
+                self._locked_warned = True
+ 
+class XlsxWriter:
+ 
+    MIN_INTERVAL_S = 1.5
+ 
+    def __init__(self, path, nhat_ky):
+        self.path = path
+        self.nhat_ky = nhat_ky
+        self._last = 0.0
+        self._locked_warned = False
+ 
+        try:
+            import openpyxl
+            self._co_openpyxl = True
+        except ImportError:
+            self._co_openpyxl = False
+            print("  [!] Chua cai openpyxl -> khong xuat duoc log.xlsx.")
+            print("      Cai bang:  py -m pip install openpyxl")
+ 
+    def write(self, force=False):
+        if not self._co_openpyxl:
+            return
+        now = time.time()
+        if not force and (now - self._last) < self.MIN_INTERVAL_S:
+            return
+        self._last = now
+        try:
+            self._build()
+            self._locked_warned = False
+        except PermissionError:
+            if not self._locked_warned:
+                print("  [!] log.xlsx bi khoa (Excel dang mo?). Dong lai de cap nhat.")
+                self._locked_warned = True
+        except Exception as e:
+            if not self._locked_warned:
+                print("  [!] Khong ghi duoc log.xlsx: %s" % e)
+                self._locked_warned = True
+ 
+    def _build(self):
+        from openpyxl import Workbook
+        from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
+        from openpyxl.utils import get_column_letter
+ 
+        thin = Side(style="thin", color="9AA5B1")
+        border = Border(left=thin, right=thin, top=thin, bottom=thin)
+        head_fill = PatternFill("solid", fgColor="1F4E79")
+        head_font = Font(bold=True, color="FFFFFF", size=11)
+        center = Alignment(horizontal="center", vertical="center")
+ 
+        wb = Workbook()
+ 
+        ws = wb.active
+        ws.title = "Nhat ky"
+ 
+        ws["A1"] = "NHẬT KÝ HOẠT ĐỘNG MẠNG LoRa"
+        ws["A1"].font = Font(bold=True, size=15, color="1F4E79")
+        ws.merge_cells("A1:Q1")
+        ws["A1"].alignment = Alignment(horizontal="center", vertical="center")
+ 
+        ws["A2"] = ("Cập nhật: %s   |   Tổng sự kiện: %d   |   "
+                    "Cấu hình: SF12 / BW125 / 915 MHz   |   "
+                    "Khoảng cách hiện tại: %s"
+                    % (datetime.datetime.now().strftime("%d/%m/%Y %H:%M:%S"),
+                       len(self.nhat_ky.rows),
+                       ("%d m" % khoang_cach_hien_tai())
+                       if khoang_cach_hien_tai() > 0 else "chưa nhập"))
+        ws["A2"].font = Font(italic=True, size=10, color="555555")
+        ws.merge_cells("A2:Q2")
+        ws["A2"].alignment = Alignment(horizontal="center")
+ 
+        headers = ["STT", "Ngày", "Giờ", "Khoảng cách (m)", "SF", "Sự kiện",
+                   "Chiều", "Nguồn", "Nội dung", "RSSI (dBm)", "SNR (dB)",
+                   "Chất lượng", "Số chặng", "Seq", "RTT đầy đủ (ms)", "Ghi chú",
+                   "Bỏ qua"]
+        for c, h in enumerate(headers, 1):
+            cell = ws.cell(row=4, column=c, value=h)
+            cell.fill = head_fill
+            cell.font = head_font
+            cell.border = border
+            cell.alignment = Alignment(horizontal="center", vertical="center",
+                                       wrap_text=True)
+ 
+        r = 5
+        for rec in self.nhat_ky.rows:
+            vals = [None, rec["ngay"], rec["gio"], rec["khoang_cach"],
+                    rec["sf"], rec["su_kien"], rec["chieu"], rec["nguon"],
+                    rec["noi_dung"], rec["rssi"], rec["snr"],
+                    rec["chat_luong"], rec["hop"], rec["seq"],
+                    rec["rtt"], rec["ghi_chu"], rec.get("bo_qua", "")]
+            fill = EVENT_FILL.get(rec["loai"])
+            for c, v in enumerate(vals, 1):
+ 
+                if c == 1:
+                    cell = ws.cell(row=r, column=c, value="=ROW()-4")
+                elif c == 17:
+                    cell = ws.cell(row=r, column=c, value=v)
+                    if v not in ("", None):
+                        cell.font = Font(bold=True, color="FFFFFF")
+                        cell.fill = PatternFill("solid", fgColor="C00000")
+                else:
+                    cell = ws.cell(row=r, column=c, value=v)
+                cell.border = border
+                if fill and c != 17:
+                    cell.fill = PatternFill("solid", fgColor=fill)
+                if c in (1, 2, 3, 4, 5, 7, 10, 11, 12, 13, 14, 15, 17):
+                    cell.alignment = center
+            r += 1
+ 
+        widths = [6, 11, 10, 14, 7, 17, 7, 8, 26, 11, 9, 13, 10, 7, 10, 34, 9]
+        for i, w in enumerate(widths, 1):
+            ws.column_dimensions[get_column_letter(i)].width = w
+        ws.row_dimensions[4].height = 30
+        ws.freeze_panes = "A5"
+        if self.nhat_ky.rows:
+            ws.auto_filter.ref = "A4:Q%d" % (r - 1)
+ 
+        last = r - 1
+        r_tb = r + 1
+ 
+        c_lbl = ws.cell(row=r_tb, column=1, value="TRUNG BÌNH")
+        c_lbl.font = Font(bold=True, size=11)
+        c_lbl.border = border
+        c_lbl.alignment = center
+        for c in range(2, len(headers) + 1):
+            cc = ws.cell(row=r_tb, column=c)
+            cc.border = border
+            cc.fill = PatternFill("solid", fgColor="FFF7D6")
+ 
+        if last >= 5:
+            for cot_so, ten in ((10, "RSSI"), (11, "SNR")):
+                col_letter = get_column_letter(cot_so)
+                f = ws.cell(row=r_tb, column=cot_so,
+                            value="=IFERROR(ROUND(AVERAGE(%s5:%s%d),1),\"\")"
+                                  % (col_letter, col_letter, last))
+                f.font = Font(bold=True, size=11)
+                f.border = border
+                f.alignment = center
+                f.number_format = "0.0"
+ 
+            ws.cell(row=r_tb, column=len(headers),
+                    value="TB của %d dòng (công thức Excel)" % (last - 4))
+ 
+        r_cnt = r_tb + 1
+        c2 = ws.cell(row=r_cnt, column=1, value="SỐ MẪU")
+        c2.font = Font(italic=True, size=10)
+        c2.border = border
+        c2.alignment = center
+        for c in range(2, len(headers) + 1):
+            ws.cell(row=r_cnt, column=c).border = border
+        if last >= 5:
+            for cot_so in (10, 11):
+                col_letter = get_column_letter(cot_so)
+                cc = ws.cell(row=r_cnt, column=cot_so,
+                             value="=COUNT(%s5:%s%d)" % (col_letter,
+                                                         col_letter, last))
+                cc.font = Font(italic=True, size=10)
+                cc.border = border
+                cc.alignment = center
+            ws.cell(row=r_cnt, column=len(headers),
+                    value="Số ô có dữ liệu (COUNT)")
+ 
+        ws2 = wb.create_sheet("Tong hop")
+        ws2["A1"] = "TỔNG HỢP THỐNG KÊ"
+        ws2["A1"].font = Font(bold=True, size=14, color="1F4E79")
+        ws2.merge_cells("A1:D1")
+ 
+        rows = self.nhat_ky.rows
+ 
+        def dem(loai):
+            return sum(1 for x in rows if x["loai"] == loai)
+ 
+        def tb_rssi(loai=None):
+            vs = [float(x["rssi"]) for x in rows
+                  if x["rssi"] not in ("", None)
+                  and (loai is None or x["loai"] == loai)]
+            return ("%.1f" % (sum(vs) / len(vs))) if vs else "—"
+ 
+        def tb_rtt():
+            vs = [float(x["rtt"]) for x in rows
+                  if x["rtt"] not in ("", None)]
+            return ("%.0f" % (sum(vs) / len(vs))) if vs else "—"
+ 
+        def dem_moc():
+            s = set()
+            for x in rows:
+                kc = x.get("khoang_cach")
+                if kc in ("", None):
+                    continue
+                try:
+                    s.add(int(float(kc)))
+                except (TypeError, ValueError):
+                    pass
+            return len(s) if s else "—"
+ 
+        def kc_max():
+            mx = 0
+            for x in rows:
+                kc = x.get("khoang_cach")
+                if kc in ("", None):
+                    continue
+                try:
+                    v = int(float(kc))
+                    if v > mx:
+                        mx = v
+                except (TypeError, ValueError):
+                    pass
+            return mx if mx > 0 else "—"
+ 
+        def dem_hop(gia_tri):
+            n = 0
+            for x in rows:
+                if x["loai"] != "msg":
+                    continue
+                h = x.get("hop")
+                if h in ("", None):
+                    continue
+                try:
+                    if int(float(h)) == gia_tri:
+                        n += 1
+                except (TypeError, ValueError):
+                    pass
+            return n
+ 
+        def dem_hop_tren():
+            n = 0
+            for x in rows:
+                if x["loai"] != "msg":
+                    continue
+                h = x.get("hop")
+                if h in ("", None):
+                    continue
+                try:
+                    if int(float(h)) >= 1:
+                        n += 1
+                except (TypeError, ValueError):
+                    pass
+            return n
+ 
+        n_rx = dem("msg")
+        n_tx = dem("tx")
+        n_ok = dem("tx_ok")
+        n_fail = dem("tx_fail")
+        n_alarm = dem("alarm") + dem("alarm_tx")
+        pdr = ("%.1f%%" % (n_ok / n_tx * 100)) if n_tx else "—"
+ 
+        stats = [
+            ("Tổng số sự kiện ghi nhận", len(rows), ""),
+            ("Tin nhắn nhận được", n_rx, "từ nút khác"),
+            ("Tin nhắn đã gửi", n_tx, "từ trạm cổng"),
+            ("Gửi thành công (có ACK)", n_ok, "RTT đầy đủ TB %s ms" % tb_rtt()),
+            ("Gửi thất bại", n_fail, "không nhận được ACK"),
+            ("Tỷ lệ gửi thành công", pdr, "trên tổng số lần gửi"),
+            ("Báo động (nhận + phát)", n_alarm, ""),
+            ("Hủy báo động", dem("clear"), ""),
+            ("RSSI trung bình - nhận", tb_rssi("msg"), "dBm"),
+            ("RSSI trung bình - báo động", tb_rssi("alarm"), "dBm"),
+ 
+            ("Số mốc khoảng cách đã đo", dem_moc(), "mốc khác nhau"),
+            ("Khoảng cách xa nhất ghi được", kc_max(), "mét"),
+            ("Tin nhận trực tiếp (số chặng = 0)", dem_hop(0), ""),
+            ("Tin qua trạm chuyển tiếp (số chặng ≥ 1)", dem_hop_tren(), ""),
+        ]
+ 
+        for c, h in enumerate(["Chỉ tiêu", "Giá trị", "Ghi chú"], 1):
+            cell = ws2.cell(row=3, column=c, value=h)
+            cell.fill = head_fill
+            cell.font = head_font
+            cell.border = border
+            cell.alignment = center
+ 
+        r2 = 4
+        for ten, gt, gc in stats:
+            ws2.cell(row=r2, column=1, value=ten).border = border
+            c2 = ws2.cell(row=r2, column=2, value=gt)
+            c2.border = border
+            c2.alignment = center
+            c2.font = Font(bold=True)
+            ws2.cell(row=r2, column=3, value=gc).border = border
+            r2 += 1
+ 
+        for col, w in zip("ABC", [34, 16, 34]):
+            ws2.column_dimensions[col].width = w
+ 
+        ws3 = wb.create_sheet("Chat luong link")
+        ws3["A1"] = "PHÂN BỐ CHẤT LƯỢNG LIÊN KẾT"
+        ws3["A1"].font = Font(bold=True, size=14, color="1F4E79")
+        ws3.merge_cells("A1:C1")
+ 
+        for c, h in enumerate(["Mức chất lượng", "Số lần", "Khoảng RSSI (dBm)"], 1):
+            cell = ws3.cell(row=3, column=c, value=h)
+            cell.fill = head_fill
+            cell.font = head_font
+            cell.border = border
+            cell.alignment = center
+ 
+        bands = [("Tốt", ">= -90"), ("Trung bình", "-110 .. -90"),
+                 ("Yếu", "-125 .. -110"), ("Rất yếu", "< -125")]
+        r3 = 4
+        for ten, khoang in bands:
+            n = sum(1 for x in rows if x["chat_luong"] == ten)
+            ws3.cell(row=r3, column=1, value=ten).border = border
+            c2 = ws3.cell(row=r3, column=2, value=n)
+            c2.border = border
+            c2.alignment = center
+            ws3.cell(row=r3, column=3, value=khoang).border = border
+            r3 += 1
+ 
+        for col, w in zip("ABC", [20, 12, 22]):
+            ws3.column_dimensions[col].width = w
+ 
+        ws4 = wb.create_sheet("Theo khoang cach")
+        ws4["A1"] = "TỔNG HỢP THEO MỐC KHOẢNG CÁCH"
+        ws4["A1"].font = Font(bold=True, size=14, color="1F4E79")
+        ws4.merge_cells("A1:H1")
+ 
+        ws4["A2"] = ("Chỉ tính các sự kiện ĐÃ được gán khoảng cách. "
+                     "Nếu sheet trống: chưa nhập khoảng cách trên dashboard.")
+        ws4["A2"].font = Font(italic=True, size=10, color="555555")
+        ws4.merge_cells("A2:H2")
+ 
+        h4 = ["Khoảng cách (m)", "Số tin nhận", "Số tin gửi", "Gửi OK",
+              "Gửi FAIL", "PDR (%)", "RSSI TB (dBm)", "SNR TB (dB)"]
+        for c, h in enumerate(h4, 1):
+            cell = ws4.cell(row=4, column=c, value=h)
+            cell.fill = head_fill
+            cell.font = head_font
+            cell.border = border
+            cell.alignment = Alignment(horizontal="center",
+                                       vertical="center", wrap_text=True)
+ 
+        moc = {}
+        for x in rows:
+            kc = x.get("khoang_cach")
+            if kc in ("", None):
+                continue
+            try:
+                k = int(float(kc))
+            except (TypeError, ValueError):
+                continue
+            if k not in moc:
+                moc[k] = {"msg": 0, "tx": 0, "ok": 0, "fail": 0,
+                          "rssi": [], "snr": []}
+            d = moc[k]
+            t = x["loai"]
+            if t == "msg":
+                d["msg"] += 1
+                if x["rssi"] not in ("", None):
+                    try:
+                        d["rssi"].append(float(x["rssi"]))
+                    except ValueError:
+                        pass
+                if x["snr"] not in ("", None):
+                    try:
+                        d["snr"].append(float(x["snr"]))
+                    except ValueError:
+                        pass
+            elif t == "tx":
+                d["tx"] += 1
+            elif t == "tx_ok":
+                d["ok"] += 1
+            elif t == "tx_fail":
+                d["fail"] += 1
+ 
+        r4 = 5
+        for k in sorted(moc.keys()):
+            d = moc[k]
+            pdr = ""
+            if d["tx"] > 0:
+                pdr = round(d["ok"] / d["tx"] * 100, 1)
+            rssi_tb = (round(sum(d["rssi"]) / len(d["rssi"]), 1)
+                       if d["rssi"] else "")
+            snr_tb = (round(sum(d["snr"]) / len(d["snr"]), 1)
+                      if d["snr"] else "")
+            vals = [k, d["msg"], d["tx"], d["ok"], d["fail"], pdr,
+                    rssi_tb, snr_tb]
+            for c, v in enumerate(vals, 1):
+                cell = ws4.cell(row=r4, column=c, value=v)
+                cell.border = border
+                if c > 1:
+                    cell.alignment = center
+ 
+            if pdr != "":
+                pc = PatternFill("solid",
+                                 fgColor=("D9F2D2" if pdr >= 95 else
+                                          "FFF2CC" if pdr >= 70 else
+                                          "F8D7DA"))
+                ws4.cell(row=r4, column=6).fill = pc
+            r4 += 1
+ 
+        for col, w in zip("ABCDEFGH", [16, 12, 12, 10, 10, 10, 14, 12]):
+            ws4.column_dimensions[col].width = w
+        if moc:
+            ws4.auto_filter.ref = "A4:H%d" % (r4 - 1)
+ 
+        if moc:
+            last4 = r4 - 1
+            r_tb4 = r4 + 1
+ 
+            c = ws4.cell(row=r_tb4, column=1, value="TRUNG BÌNH")
+            c.font = Font(bold=True, size=11)
+            c.border = border
+            c.alignment = center
+            for cc in range(2, 9):
+                x = ws4.cell(row=r_tb4, column=cc)
+                x.border = border
+                x.fill = PatternFill("solid", fgColor="FFF7D6")
+ 
+            for cot_so in (6, 7, 8):
+                col_letter = get_column_letter(cot_so)
+                f = ws4.cell(
+                    row=r_tb4, column=cot_so,
+                    value="=IFERROR(ROUND(AVERAGE(%s5:%s%d),1),\"\")"
+                          % (col_letter, col_letter, last4))
+                f.font = Font(bold=True, size=11)
+                f.border = border
+                f.alignment = center
+                f.number_format = "0.0"
+ 
+            r_tong4 = r_tb4 + 1
+            c = ws4.cell(row=r_tong4, column=1, value="TỔNG")
+            c.font = Font(bold=True, size=11)
+            c.border = border
+            c.alignment = center
+            for cc in range(2, 9):
+                x = ws4.cell(row=r_tong4, column=cc)
+                x.border = border
+ 
+            for cot_so in (2, 3, 4, 5):
+                col_letter = get_column_letter(cot_so)
+                f = ws4.cell(row=r_tong4, column=cot_so,
+                             value="=SUM(%s5:%s%d)" % (col_letter,
+                                                       col_letter, last4))
+                f.font = Font(bold=True, size=11)
+                f.border = border
+                f.alignment = center
+ 
+            try:
+                from openpyxl.chart import LineChart, BarChart, Reference
+ 
+                cats = Reference(ws4, min_col=1, min_row=5, max_row=last4)
+ 
+                def _line(tieu_de, cot, truc_y, neo):
+                    ch = LineChart()
+                    ch.title = tieu_de
+                    ch.style = 12
+                    ch.y_axis.title = truc_y
+                    ch.x_axis.title = "Khoang cach (m)"
+                    ch.height = 8
+                    ch.width = 15
+                    ref = Reference(ws4, min_col=cot, min_row=4,
+                                    max_row=last4)
+                    ch.add_data(ref, titles_from_data=True)
+                    ch.set_categories(cats)
+                    ws4.add_chart(ch, neo)
+                    return ch
+ 
+                def _bar(tieu_de, min_c, max_c, truc_y, neo, stacked=False):
+                    ch = BarChart()
+                    ch.type = "col"
+                    if stacked:
+                        ch.grouping = "stacked"
+                        ch.overlap = 100
+                    ch.title = tieu_de
+                    ch.y_axis.title = truc_y
+                    ch.x_axis.title = "Khoang cach (m)"
+                    ch.height = 8
+                    ch.width = 15
+                    ref = Reference(ws4, min_col=min_c, max_col=max_c,
+                                    min_row=4, max_row=last4)
+                    ch.add_data(ref, titles_from_data=True)
+                    ch.set_categories(cats)
+                    ws4.add_chart(ch, neo)
+                    return ch
+ 
+                _line("RSSI theo khoảng cách", 7, "RSSI (dBm)", "J4")
+ 
+                _line("SNR theo khoảng cách", 8, "SNR (dB)", "J22")
+ 
+                _bar("Tỷ lệ nhận gói (PDR) theo khoảng cách",
+                     6, 6, "PDR (%)", "J40")
+ 
+                _bar("Số lần gửi thành công / thất bại theo khoảng cách",
+                     4, 5, "Số lần", "J58", stacked=True)
+ 
+            except Exception as _e:
+ 
+                print("  [!] Khong ve duoc bieu do: %s" % _e)
+ 
+        wb.save(self.path)
+ 
+csv_writer = CsvWriter(CSV_FILE)
+xlsx_writer = XlsxWriter("log.xlsx", nhat_ky)
+ 
+def _ghi_lai_toan_bo():
+    import os
+ 
+    try:
+        with open(csv_writer.path, "w", encoding="utf-8-sig", newline="") as f:
+            w = csv.writer(f)
+            w.writerow(CSV_HEADER)
+            for rec in nhat_ky.rows:
+                w.writerow([
+                    rec["stt"], rec["ngay"], rec["gio"], rec["khoang_cach"],
+                    rec["sf"], rec["su_kien"], rec["chieu"], rec["nguon"],
+                    rec["noi_dung"], rec["rssi"], rec["snr"],
+                    rec["chat_luong"], rec["hop"], rec["seq"], rec["rtt"],
+                    rec["ghi_chu"], rec.get("bo_qua", ""),
+                ])
+    except (PermissionError, OSError) as e:
+        print("  [!] Khong ghi lai duoc log.csv: %s" % e)
+ 
+    xlsx_writer.write(force=True)
+ 
+def nap_lich_su():
+    import os
+    if not os.path.isfile(CSV_FILE):
+        print("  [i] Chua co log.csv -> bat dau nhat ky moi.")
+        return 0
+ 
+    so_dong = 0
+    try:
+        with open(CSV_FILE, "r", encoding="utf-8-sig", newline="") as f:
+            rd = csv.DictReader(f)
+ 
+            if not rd.fieldnames or rd.fieldnames[0].strip() != "STT":
+                print("  [i] log.csv dinh dang cu -> khong nap lich su.")
+                return 0
+ 
+            for row in rd:
+                try:
+                    loai = None
+ 
+                    for k, (ten, _chieu) in EVENT_INFO.items():
+                        if ten == (row.get("Sự kiện") or "").strip():
+                            loai = k
+                            break
+                    if loai is None:
+                        continue
+ 
+                    ngay = (row.get("Ngày") or "").strip()
+                    gio = (row.get("Giờ") or "").strip()
+                    ts = ("%s %s" % (ngay, gio)).strip() or "--:--:--"
+ 
+                    def _num(v):
+                        v = (v or "").strip()
+                        if v == "":
+                            return ""
+                        try:
+                            return float(v)
+                        except ValueError:
+                            return v
+ 
+                    ev = {
+                        "type": loai,
+                        "src": (row.get("Nguồn") or "").strip(),
+                        "text": (row.get("Nội dung") or "").strip(),
+                        "rssi": _num(row.get("RSSI (dBm)")),
+                        "snr": _num(row.get("SNR (dB)")),
+                        "hop": (row.get("Số chặng") or "").strip(),
+                        "seq": (row.get("Seq") or "").strip(),
+                        "rtt_ms": (row.get("RTT đầy đủ (ms)")
+                                   or row.get("RTT (ms)") or "").strip(),
+                    }
+ 
+                    with state.lock:
+                        t = ev["type"]
+                        if t == "msg":
+                            state.n_rx += 1
+                            if ev["rssi"] != "":
+                                state.last_rssi = ev["rssi"]
+                                state.last_snr = ev["snr"]
+                        elif t == "alarm":
+                            state.n_alarm += 1
+                            if ev["rssi"] != "":
+                                state.last_rssi = ev["rssi"]
+                                state.last_snr = ev["snr"]
+                        elif t == "clear":
+                            state.n_clear += 1
+                        elif t == "tx_ok":
+                            state.n_tx_ok += 1
+                            if ev["rtt_ms"] != "":
+                                state.last_rtt = ev["rtt_ms"]
+                        elif t == "tx_fail":
+                            state.n_tx_fail += 1
+                        elif t == "alarm_tx":
+                            state.n_alarm_tx = getattr(state, "n_alarm_tx", 0) + 1
+ 
+                        state.logs.appendleft({
+                            "ts": ts,
+                            "type": t,
+                            "src": ev["src"],
+                            "text": ev["text"],
+                            "rssi": ev["rssi"],
+                            "snr": ev["snr"],
+                            "hop": ev["hop"],
+                            "seq": ev["seq"],
+                            "rtt_ms": ev["rtt_ms"],
+                        })
+ 
+                        if t in ("msg", "alarm") and ev["rssi"] != "":
+                            state.chart_data.append({
+                                "ts": ts,
+                                "rssi": ev["rssi"],
+                                "snr": ev["snr"],
+                                "type": t,
+                            })
+ 
+                    rec = nhat_ky.them(ev)
+                    rec["ngay"] = ngay or rec["ngay"]
+                    rec["gio"] = gio or rec["gio"]
+                    so_dong += 1
+ 
+                except Exception:
+                    continue
+    except (PermissionError, OSError) as e:
+        print("  [!] Khong doc duoc log.csv: %s" % e)
+        return 0
+ 
+    if so_dong:
+        print("  [OK] Da nap %d su kien lich su tu log.csv" % so_dong)
+        print("       (dashboard hien lai lich su cu + tiep tuc nhan moi)")
+ 
+        xlsx_writer.write(force=True)
+    return so_dong
+ 
+class LogParser:
+    def __init__(self, emit_fn):
+        self.emit = emit_fn
+        self.pending_rx = None
+        self.pending_alarm = None
+ 
+    def feed(self, line):
+        line = line.rstrip("\r\n")
+        ts = datetime.datetime.now().strftime("%H:%M:%S")
+ 
+        m = CFG_RE.search(line)
+        if m:
+            with state.lock:
+                state.cfg_sf   = int(m.group(2))
+                state.cfg_bw   = float(m.group(3))
+                state.cfg_cr   = m.group(4)
+                state.cfg_freq = float(m.group(5))
+                state.cfg_pwr  = int(m.group(6))
+                state.cfg_rep  = int(m.group(7))
+                state.cfg_node = m.group(1)
+            print("  [CFG] Node '%s' | SF=%s | BW=%s kHz | CR=4/%s | %s MHz"
+                  % (m.group(1), m.group(2), m.group(3), m.group(4), m.group(5)))
+            return
+ 
+        m = RX_RE.search(line)
+        if m:
+            self.pending_rx = {
+                "type": "msg", "num": int(m.group(1)), "text": m.group(2),
+            }
+            return
+ 
+        m = SRC_RE.search(line)
+        if m and self.pending_rx:
+            self.pending_rx["src"] = m.group(1)
+            self.pending_rx["hop"] = int(m.group(2))
+            self.pending_rx["seq"] = int(m.group(3))
+            return
+ 
+        m = RSSI_RE.search(line)
+        if m:
+            rssi, snr = float(m.group(1)), float(m.group(2))
+            if self.pending_rx:
+                self.pending_rx["rssi"] = rssi
+                self.pending_rx["snr"] = snr
+                self._dispatch(self.pending_rx, ts)
+                self.pending_rx = None
+            elif self.pending_alarm:
+                self.pending_alarm["rssi"] = rssi
+                self.pending_alarm["snr"] = snr
+                self._dispatch(self.pending_alarm, ts)
+                self.pending_alarm = None
+            return
+ 
+        m = ALARM_RE.search(line)
+        if m:
+            ev = {"type": "alarm", "src": m.group(1)}
+            mr = ALARM_RSSI_RE.search(line)
+            if mr:
+                ev["rssi"] = float(mr.group(1))
+                ev["snr"]  = float(mr.group(2))
+                self._dispatch(ev, ts)
+            else:
+ 
+                self.pending_alarm = ev
+            return
+ 
+        m = ALARM_RSSI_RE.search(line)
+        if m and self.pending_alarm:
+            self.pending_alarm["rssi"] = float(m.group(1))
+            self.pending_alarm["snr"]  = float(m.group(2))
+            self._dispatch(self.pending_alarm, ts)
+            self.pending_alarm = None
+            return
+ 
+        m = ALARMTXCLEAR_RE.search(line)
+        if m:
+            self._dispatch({"type": "clear", "src": m.group(1)}, ts)
+            return
+ 
+        m = CLEAR_RE.search(line)
+        if m:
+            self._dispatch({"type": "clear", "src": m.group(1)}, ts)
+            return
+ 
+        m = TX_RE.search(line)
+        if m:
+            self._dispatch({
+                "type": "tx", "num": int(m.group(1)), "text": m.group(2),
+            }, ts)
+            return
+ 
+        m = TXOK_RE.search(line)
+        if m:
+            self._dispatch({"type": "tx_ok", "rtt_ms": int(m.group(1))}, ts)
+            return
+ 
+        m = TXFAIL_RE.search(line)
+        if m:
+            self._dispatch({"type": "tx_fail"}, ts)
+            return
+ 
+        m = ALARMTX_RE.search(line)
+        if m:
+            self._dispatch({
+                "type": "alarm_tx",
+                "attempt": int(m.group(1)),
+                "seq": int(m.group(2)),
+            }, ts)
+            return
+ 
+    def _dispatch(self, ev, ts):
+        ev["ts"] = ts
+ 
+        with state.lock:
+            t = ev["type"]
+            if t == "msg":
+                state.n_rx += 1
+                state.last_rssi = ev.get("rssi")
+                state.last_snr = ev.get("snr")
+            elif t == "alarm":
+                state.n_alarm += 1
+                state.alarm_active = True
+                state.alarm_src = ev.get("src")
+                state.alarm_ts = datetime.datetime.now()
+                state.last_rssi = ev.get("rssi")
+                state.last_snr = ev.get("snr")
+            elif t == "clear":
+                state.n_clear += 1
+                state.alarm_active = False
+                state.alarm_src = None
+            elif t == "tx":
+                pass
+            elif t == "tx_ok":
+                state.n_tx_ok += 1
+                state.last_rtt = ev.get("rtt_ms")
+            elif t == "tx_fail":
+                state.n_tx_fail += 1
+            elif t == "alarm_tx":
+ 
+                state.alarm_active = True
+                state.alarm_src    = "B"
+                state.alarm_ts     = datetime.datetime.now()
+ 
+                state.n_alarm_tx = getattr(state, "n_alarm_tx", 0) + 1
+ 
+            if t == "msg":
+                ghi_nhan_seq(ev.get("src"), ev.get("seq"))
+ 
+            log_entry = {
+                "ts": ts,
+                "type": t,
+                "src": ev.get("src", ""),
+                "text": ev.get("text", ""),
+                "rssi": ev.get("rssi", ""),
+                "snr": ev.get("snr", ""),
+                "hop": ev.get("hop", ""),
+                "seq": ev.get("seq", ""),
+                "rtt_ms": ev.get("rtt_ms", ""),
+            }
+            state.logs.appendleft(log_entry)
+ 
+            if t in ("msg", "alarm") and ev.get("rssi") is not None:
+                state.chart_data.append({
+                    "ts": ts,
+                    "rssi": ev["rssi"],
+                    "snr": ev.get("snr", ""),
+                    "type": t,
+                })
+ 
+        rec = nhat_ky.them(ev)
+        csv_writer.write(rec)
+        xlsx_writer.write()
+ 
+        with state.lock:
+            stats_snapshot = {
+                "n_rx": state.n_rx,
+                "n_tx_ok": state.n_tx_ok,
+                "n_tx_fail": state.n_tx_fail,
+                "n_alarm": state.n_alarm,
+                "n_alarm_tx": state.n_alarm_tx,
+                "n_clear": state.n_clear,
+                "last_rssi": state.last_rssi,
+                "last_snr": state.last_snr,
+                "last_rtt": state.last_rtt,
+                "alarm_active": state.alarm_active,
+                "alarm_src": state.alarm_src,
+                "n_lost": state.n_lost,
+                "n_expected": state.n_expected,
+                "pdr": tinh_pdr(),
+                "sf": state.cfg_sf,
+                "bw": state.cfg_bw,
+                "freq": state.cfg_freq,
+                "rep": state.cfg_rep,
+            }
+        self.emit("event", {"log": log_entry, "stats": stats_snapshot})
+ 
+DASHBOARD_HTML = r"""<!DOCTYPE html>
+<html lang="vi">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>LoRa Gateway Dashboard</title>
+<script src="https://cdn.socket.io/4.7.5/socket.io.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.4/dist/chart.umd.min.js"></script>
+<style>
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  body { font-family: 'Segoe UI', system-ui, sans-serif; background: #0f172a; color: #e2e8f0; }
+ 
+  /* HEADER */
+  .header { background: #1e293b; padding: 16px 24px; display: flex; justify-content: space-between; align-items: center; border-bottom: 2px solid #334155; }
+  .header h1 { font-size: 20px; font-weight: 700; }
+  .status-dot { width: 12px; height: 12px; border-radius: 50%; display: inline-block; margin-right: 8px; }
+  .status-dot.green { background: #22c55e; box-shadow: 0 0 8px #22c55e; }
+  .status-dot.red { background: #ef4444; box-shadow: 0 0 12px #ef4444; animation: pulse 0.8s infinite; }
+  @keyframes pulse { 0%,100% { opacity: 1; } 50% { opacity: 0.4; } }
+ 
+  /* ALARM OVERLAY */
+  .alarm-overlay { display: none; position: fixed; top: 0; left: 0; right: 0; bottom: 0;
+    background: rgba(220,38,38,0.15); z-index: 100; pointer-events: none;
+    animation: alarmFlash 1s infinite; }
+  .alarm-overlay.active { display: block; }
+  @keyframes alarmFlash { 0%,100% { background: rgba(220,38,38,0.05); } 50% { background: rgba(220,38,38,0.25); } }
+ 
+  /* STATS CARDS */
+  .stats { display: grid; grid-template-columns: repeat(auto-fit, minmax(150px, 1fr)); gap: 12px; padding: 16px 24px; }
+  .stat-card { background: #1e293b; border-radius: 8px; padding: 16px; text-align: center; border: 1px solid #334155; }
+  .stat-card .label { font-size: 12px; color: #94a3b8; text-transform: uppercase; letter-spacing: 1px; }
+  .stat-card .value { font-size: 28px; font-weight: 700; margin-top: 4px; }
+ 
+  /* TOOLBAR: nut tai file */
+  .toolbar { display: flex; align-items: center; gap: 12px; padding: 0 24px 16px; flex-wrap: wrap; }
+  .toolbar button { border: none; border-radius: 6px; padding: 10px 18px; font-size: 14px;
+    font-weight: 600; cursor: pointer; transition: filter .15s; color: #fff; }
+  .toolbar button:hover { filter: brightness(1.15); }
+  .toolbar button:active { filter: brightness(0.9); }
+  .btn-excel { background: #16a34a; }
+  .btn-csv { background: #475569; }
+  .btn-marker { background: #7c3aed; padding: 8px 14px !important;
+    font-size: 13px !important; }
+  .btn-skip { background: #64748b; padding: 8px 14px !important;
+    font-size: 13px !important; }
+  .btn-skip.confirm { background: #f59e0b; }
+  .btn-report { background: #0284c7; }
+  .btn-reset { background: #b91c1c; }
+  .btn-reset.confirm { background: #f59e0b; }
+  .toolbar-hint { font-size: 12px; color: #64748b; }
+  .toolbar-hint-row { padding: 0 24px 16px; }
+ 
+  /* O NHAP KHOANG CACH DO THUC NGHIEM */
+  .dist-box {
+    display: flex; align-items: center; gap: 8px;
+    background: #1e293b; border: 1px solid #334155;
+    border-radius: 6px; padding: 8px 14px;
+  }
+  .dist-box label { font-size: 13px; color: #94a3b8; font-weight: 600; }
+  .dist-box input {
+    width: 90px; padding: 6px 10px; font-size: 14px;
+    border-radius: 4px; border: 1px solid #475569;
+    background: #0f172a; color: #e2e8f0; text-align: center;
+  }
+  .dist-box input:focus { outline: 2px solid #38bdf8; }
+  .btn-dist { background: #0891b2; padding: 8px 14px !important;
+    font-size: 13px !important; }
+  .dist-now { font-size: 13px; color: #22c55e; font-weight: 600;
+    min-width: 90px; }
+ 
+  /* PDR card: doi mau theo chat luong */
+  #pdrCard.good { border-color: #22c55e; }
+  #pdrCard.good #pdrVal { color: #22c55e; }
+  #pdrCard.mid { border-color: #f59e0b; }
+  #pdrCard.mid #pdrVal { color: #f59e0b; }
+  #pdrCard.bad { border-color: #ef4444; }
+  #pdrCard.bad #pdrVal { color: #ef4444; }
+  /* The RSSI/SNR: doi mau vien + so theo nguong thuc nghiem */
+  #rssiCard.good { border-color: #22c55e; }
+  #rssiCard.good #lastRssi { color: #22c55e; }
+  #rssiCard.mid { border-color: #f59e0b; }
+  #rssiCard.mid #lastRssi { color: #f59e0b; }
+  #rssiCard.bad { border-color: #ef4444; }
+  #rssiCard.bad #lastRssi { color: #ef4444; }
+  .stat-card .sub { font-size: 12px; color: #64748b; margin-top: 2px; }
+  .stat-card.alarm { border-color: #ef4444; }
+  .stat-card.alarm .value { color: #ef4444; }
+ 
+  /* MAIN CONTENT */
+  .main { display: grid; grid-template-columns: 1fr 1fr; gap: 16px; padding: 0 24px 16px; }
+  @media (max-width: 900px) { .main { grid-template-columns: 1fr; } }
+ 
+  /* CHART */
+  .chart-box { background: #1e293b; border-radius: 8px; padding: 16px; border: 1px solid #334155; }
+  .chart-box h2 { font-size: 14px; color: #94a3b8; margin-bottom: 12px; }
+  .chart-container { position: relative; height: 250px; }
+ 
+  /* LOG TABLE */
+  .log-box { background: #1e293b; border-radius: 8px; padding: 16px; border: 1px solid #334155; overflow: hidden; display: flex; flex-direction: column; }
+  .log-box h2 { font-size: 14px; color: #94a3b8; margin-bottom: 12px; }
+  .log-list { flex: 1; overflow-y: auto; max-height: 280px; font-family: 'Consolas', monospace; font-size: 13px; }
+  .log-entry { padding: 6px 8px; border-bottom: 1px solid #1e293b; display: flex; gap: 8px; align-items: baseline; }
+  .log-entry:nth-child(even) { background: #162032; }
+  .log-ts { color: #64748b; white-space: nowrap; min-width: 70px; }
+  .log-type { font-weight: 600; min-width: 60px; }
+  .log-type.msg { color: #38bdf8; }
+  .log-type.tx { color: #a78bfa; }
+  .log-type.tx_ok { color: #22c55e; }
+  .log-type.tx_fail { color: #f87171; }
+  .log-type.alarm { color: #ef4444; font-weight: 800; }
+  .log-type.alarm_tx { color: #ef4444; font-weight: 800; }
+  .log-type.clear { color: #fbbf24; }
+  .log-type.marker { color: #a78bfa; font-weight: 800; }
+  .log-body { color: #cbd5e1; word-break: break-all; }
+  .log-rssi { color: #64748b; font-size: 11px; white-space: nowrap; }
+</style>
+</head>
+<body>
+ 
+<div class="alarm-overlay" id="alarmOverlay"></div>
+ 
+<div class="header">
+  <h1>&#x1F4E1; LoRa Gateway Dashboard</h1>
+  <div><span class="status-dot green" id="statusDot"></span><span id="statusText">LIVE</span></div>
+</div>
+ 
+<div class="stats">
+  <div class="stat-card"><div class="label">Tin tu Node A</div><div class="value" id="nRx">0</div></div>
+  <div class="stat-card"><div class="label">Node B gui OK</div><div class="value" id="nTxOk">0</div></div>
+  <div class="stat-card"><div class="label">Node B gui Fail</div><div class="value" id="nTxFail">0</div><div class="sub" id="lastRtt">RTT đầy đủ: -</div></div>
+  <div class="stat-card alarm" id="alarmCard"><div class="label">Canh bao chay</div><div class="value" id="nAlarm">0</div><div class="sub" id="alarmSrc">-</div></div>
+  <div class="stat-card"><div class="label">Da huy bao dong</div><div class="value" id="nClear">0</div></div>
+  <div class="stat-card" id="rssiCard"><div class="label">RSSI / SNR</div><div class="value" id="lastRssi">-</div><div class="sub" id="lastSnr">SNR: -</div></div>
+  <div class="stat-card" id="pdrCard"><div class="label">Ty le nhan goi (PDR)</div><div class="value" id="pdrVal">-</div><div class="sub" id="lostVal">Mat: -</div></div>
+  <div class="stat-card" id="cfgCard"><div class="label">Cau hinh RF</div><div class="value" id="cfgSf">-</div><div class="sub" id="cfgInfo">SF: -</div></div>
+</div>
+ 
+<div class="toolbar">
+  <div class="dist-box">
+    <label for="inpDist">Khoảng cách đo (m):</label>
+    <input type="number" id="inpDist" min="0" step="10" placeholder="0"
+           value="0">
+    <button id="btnSetDist" class="btn-dist">Đặt</button>
+    <button id="btnMarker" class="btn-marker" title="Ghi 1 dong danh dau vao Excel de tach moc">&#x1F4CC; Chốt mốc</button>
+    <button id="btnSkip" class="btn-skip" title="Bo qua toan bo du lieu cua moc nay (test / do sai)">&#x1F6AB; Bỏ qua mốc</button>
+    <span id="distNow" class="dist-now">Chưa nhập</span>
+  </div>
+  <button id="btnExcel" class="btn-excel">&#x1F4E5; Tai file Excel (log.xlsx)</button>
+  <button id="btnCsv" class="btn-csv">&#x1F4C4; Tai file CSV (log.csv)</button>
+  <button id="btnReport" class="btn-report">&#x1F4CA; Phan tich (hoi quy)</button>
+  <button id="btnReset" class="btn-reset" title="Lam moi log, luu file cu sang ten co timestamp">&#x1F5D1; Lam moi log</button>
+</div>
+<div class="toolbar-hint-row">
+  <span class="toolbar-hint">
+    Nhập khoảng cách TRƯỚC khi gửi tin. Bấm "Chốt mốc" khi đổi sang khoảng
+    cách mới để tách rõ từng mốc trong Excel. "Làm mới log" xoá dữ liệu
+    đang xem (file cũ vẫn được giữ lại).
+  </span>
+</div>
+ 
+<div class="main">
+  <div class="chart-box">
+    <h2>RSSI va SNR theo thoi gian</h2>
+    <div class="chart-container"><canvas id="rssiChart"></canvas></div>
+  </div>
+  <div class="log-box">
+    <h2>Log su kien (moi nhat o tren)</h2>
+    <div class="log-list" id="logList"></div>
+  </div>
+</div>
+ 
+<script>
+// --- SOCKET.IO ---
+const socket = io();
+ 
+// --- CHART.JS: RSSI + SNR tren 2 truc y ---
+// RSSI khoang -140..-30 dBm ; SNR khoang -20..+15 dB -> phai dung 2 truc
+// rieng, neu chung 1 truc thi duong SNR se bi det xuong day do thang lech.
+const ctx = document.getElementById('rssiChart').getContext('2d');
+const chart = new Chart(ctx, {
+  type: 'line',
+  data: {
+    labels: [],
+    datasets: [
+      {
+        label: 'RSSI (dBm)',
+        data: [],
+        borderColor: '#38bdf8',
+        backgroundColor: 'rgba(56,189,248,0.10)',
+        fill: true,
+        tension: 0.3,
+        pointRadius: 3,
+        yAxisID: 'y',
+      },
+      {
+        label: 'SNR (dB)',
+        data: [],
+        borderColor: '#22c55e',
+        backgroundColor: 'rgba(34,197,94,0.08)',
+        fill: false,
+        tension: 0.3,
+        pointRadius: 3,
+        borderDash: [5, 3],
+        yAxisID: 'y1',
+      }
+    ]
+  },
+  options: {
+    responsive: true,
+    maintainAspectRatio: false,
+    animation: false,
+    interaction: { mode: 'index', intersect: false },
+    scales: {
+      x: { ticks: { color: '#64748b', maxTicksLimit: 8 }, grid: { color: '#1e293b' } },
+      y: {
+        position: 'left',
+        min: -140, max: -30,
+        title: { display: true, text: 'RSSI (dBm)', color: '#38bdf8', font: { size: 11 } },
+        ticks: { color: '#38bdf8' }, grid: { color: '#1e293b' }
+      },
+      y1: {
+        position: 'right',
+        min: -20, max: 15,
+        title: { display: true, text: 'SNR (dB)', color: '#22c55e', font: { size: 11 } },
+        ticks: { color: '#22c55e' }, grid: { drawOnChartArea: false }
+      }
+    },
+    plugins: {
+      legend: { display: true, labels: { color: '#94a3b8', boxWidth: 14, font: { size: 11 } } }
+    }
+  }
+});
+ 
+// --- WEB AUDIO ALARM ---
+let audioCtx = null;
+let alarmOscillator = null;
+ 
+function startAlarmSound() {
+  if (alarmOscillator) return;
+  try {
+    audioCtx = audioCtx || new (window.AudioContext || window.webkitAudioContext)();
+    alarmOscillator = audioCtx.createOscillator();
+    const gain = audioCtx.createGain();
+    alarmOscillator.type = 'square';
+    alarmOscillator.frequency.value = 880;
+    gain.gain.value = 0.15;
+    alarmOscillator.connect(gain);
+    gain.connect(audioCtx.destination);
+    alarmOscillator.start();
+    // Modulate: on/off pattern
+    const lfo = audioCtx.createOscillator();
+    lfo.frequency.value = 3;
+    const lfoGain = audioCtx.createGain();
+    lfoGain.gain.value = 0.15;
+    lfo.connect(lfoGain);
+    lfoGain.connect(gain.gain);
+    lfo.start();
+    alarmOscillator._lfo = lfo;
+  } catch(e) { console.log('Audio not available:', e); }
+}
+ 
+function stopAlarmSound() {
+  if (alarmOscillator) {
+    try { alarmOscillator.stop(); alarmOscillator._lfo && alarmOscillator._lfo.stop(); } catch(e){}
+    alarmOscillator = null;
+  }
+}
+ 
+// --- UI UPDATE ---
+function updateStats(s) {
+  document.getElementById('nRx').textContent = s.n_rx;
+  document.getElementById('nTxOk').textContent = s.n_tx_ok;
+  document.getElementById('nTxFail').textContent = s.n_tx_fail;
+  document.getElementById('nAlarm').textContent = s.n_alarm;
+  document.getElementById('nClear').textContent = s.n_clear;
+  document.getElementById('lastRssi').textContent = s.last_rssi != null ? s.last_rssi + ' dBm' : '-';
+  document.getElementById('lastSnr').textContent = s.last_snr != null ? 'SNR: ' + s.last_snr + ' dB' : 'SNR: -';
+  document.getElementById('lastRtt').textContent = s.last_rtt != null ? 'RTT đầy đủ: ' + s.last_rtt + ' ms' : 'RTT đầy đủ: -';
+ 
+  // --- TO MAU THE RSSI/SNR THEO NGUONG THUC NGHIEM ---
+  // Nguong do tu thuc nghiem: > -120 tot, -127..-120 vung xam, < -127 mat.
+  const rssiCard = document.getElementById('rssiCard');
+  rssiCard.classList.remove('good', 'mid', 'bad');
+  if (s.last_rssi != null) {
+    const r = parseFloat(s.last_rssi);
+    if (r > -120) rssiCard.classList.add('good');
+    else if (r >= -127) rssiCard.classList.add('mid');
+    else rssiCard.classList.add('bad');
+  }
+ 
+  // --- CAU HINH RF (SF, BW, tan so) ---
+  const cfgSfEl = document.getElementById('cfgSf');
+  const cfgInfoEl = document.getElementById('cfgInfo');
+  if (s.sf != null) {
+    cfgSfEl.textContent = 'SF' + s.sf;
+    cfgInfoEl.textContent = (s.bw || '?') + ' kHz | '
+      + (s.freq || '?') + ' MHz | ' + (s.rep ? 'co repeater' : 'khong rep');
+    // SF thap = tam xa ngan -> to mau canh bao
+    cfgSfEl.style.color = (s.sf >= 11) ? '#22c55e'
+                        : (s.sf >= 9)  ? '#f59e0b' : '#ef4444';
+  } else {
+    cfgSfEl.textContent = '-';
+    cfgInfoEl.textContent = 'Chua doc duoc [CFG]';
+  }
+  const pdrEl = document.getElementById('pdrVal');
+  const lostEl = document.getElementById('lostVal');
+  const pdrCard = document.getElementById('pdrCard');
+  pdrCard.classList.remove('good', 'mid', 'bad');
+  if (s.pdr == null) {
+    pdrEl.textContent = '-';
+    lostEl.textContent = 'Chua du du lieu';
+  } else {
+    pdrEl.textContent = s.pdr.toFixed(1) + '%';
+    lostEl.textContent = 'Mat: ' + s.n_lost + '/' + s.n_expected;
+    if (s.pdr >= 95) pdrCard.classList.add('good');
+    else if (s.pdr >= 80) pdrCard.classList.add('mid');
+    else pdrCard.classList.add('bad');
+  }
+ 
+  const overlay = document.getElementById('alarmOverlay');
+  const dot = document.getElementById('statusDot');
+  const statusText = document.getElementById('statusText');
+  const alarmCard = document.getElementById('alarmCard');
+  const alarmSrcEl = document.getElementById('alarmSrc');
+ 
+  if (s.alarm_active) {
+    overlay.classList.add('active');
+    dot.className = 'status-dot red';
+    statusText.textContent = 'BAO DONG!';
+    alarmCard.style.borderColor = '#ef4444';
+    alarmSrcEl.textContent = (s.alarm_src === 'B')
+      ? 'GATEWAY tu phat!' : 'Tu Node ' + (s.alarm_src || '?');
+    startAlarmSound();
+  } else {
+    overlay.classList.remove('active');
+    dot.className = 'status-dot green';
+    statusText.textContent = 'LIVE';
+    alarmCard.style.borderColor = '#334155';
+    alarmSrcEl.textContent = '-';
+    stopAlarmSound();
+  }
+}
+ 
+function addLogEntry(ev) {
+  const list = document.getElementById('logList');
+  const div = document.createElement('div');
+  div.className = 'log-entry';
+ 
+  const typeLabels = {
+    msg: 'Node A', tx: 'Node B', tx_ok: 'B OK', tx_fail: 'B FAIL',
+    alarm: 'BAO CHAY', clear: 'HUY', alarm_tx: 'B SOS', marker: 'MOC DO'
+  };
+  const typeClass = ev.type || 'msg';
+  const label = typeLabels[typeClass] || ev.type;
+ 
+  let body = '';
+  if (ev.type === 'msg') body = '"' + (ev.text||'') + '" tu Node ' + (ev.src||'?');
+  else if (ev.type === 'tx') body = 'Node B gui: "' + (ev.text||'') + '"';
+  else if (ev.type === 'tx_ok') body = 'Node B gui thanh cong | RTT đầy đủ ' + (ev.rtt_ms||'?') + ' ms (đi+về)';
+  else if (ev.type === 'tx_fail') body = 'Node B gui that bai - khong co ACK';
+  else if (ev.type === 'alarm') body = '!!! BAO CHAY tu Node ' + (ev.src||'?') + ' !!!';
+  else if (ev.type === 'alarm_tx') body = '!!! GATEWAY (Node B) TU PHAT BAO DONG - lan ' + (ev.attempt||'?') + ' !!!';
+  else if (ev.type === 'clear') body = (ev.src === 'watchdog' ? '[Timeout 45s] Tu tat canh bao' : 'Node ' + (ev.src||'?') + ' da huy bao dong');
+  else if (ev.type === 'marker') body = '=== CHOT MOC ' + (ev.text||'?') + ' m ===';
+ 
+  let rssiStr = '';
+  if (ev.rssi !== '' && ev.rssi != null) rssiStr = ev.rssi + ' dBm';
+ 
+  div.innerHTML = '<span class="log-ts">' + (ev.ts||'') + '</span>'
+    + '<span class="log-type ' + typeClass + '">' + label + '</span>'
+    + '<span class="log-body">' + body + '</span>'
+    + '<span class="log-rssi">' + rssiStr + '</span>';
+ 
+  list.insertBefore(div, list.firstChild);
+ 
+  // Gioi han so dong hien thi
+  while (list.children.length > 200) list.removeChild(list.lastChild);
+}
+ 
+function addChartPoint(ev) {
+  if (ev.rssi == null || ev.rssi === '') return;
+  chart.data.labels.push(ev.ts);
+  chart.data.datasets[0].data.push(ev.rssi);
+  // SNR: chi ve khi co gia tri (tin nhan/bao dong deu co)
+  const snr = (ev.snr === '' || ev.snr == null) ? null : ev.snr;
+  chart.data.datasets[1].data.push(snr);
+  // Gioi han so diem
+  if (chart.data.labels.length > 100) {
+    chart.data.labels.shift();
+    chart.data.datasets[0].data.shift();
+    chart.data.datasets[1].data.shift();
+  }
+  chart.update('none');
+}
+ 
+// --- SOCKET EVENTS ---
+socket.on('connect', () => {
+  document.getElementById('statusText').textContent = 'CONNECTED';
+});
+ 
+socket.on('snapshot', (s) => {
+  updateStats(s);
+  // Load logs cu
+  const list = document.getElementById('logList');
+  list.innerHTML = '';
+  (s.logs || []).forEach(ev => addLogEntry(ev));
+  // Load chart cu (ca RSSI lan SNR)
+  chart.data.labels = [];
+  chart.data.datasets[0].data = [];
+  chart.data.datasets[1].data = [];
+  (s.chart_data || []).forEach(pt => {
+    chart.data.labels.push(pt.ts);
+    chart.data.datasets[0].data.push(pt.rssi);
+    chart.data.datasets[1].data.push((pt.snr === '' || pt.snr == null) ? null : pt.snr);
+  });
+  chart.update('none');
+});
+ 
+socket.on('event', (data) => {
+  const ev = data.log || data;
+  addLogEntry(ev);
+  addChartPoint(ev);
+  if (data.stats) updateStats(data.stats);
+});
+ 
+// Click anywhere to unlock AudioContext (browser policy)
+document.addEventListener('click', () => {
+  if (audioCtx && audioCtx.state === 'suspended') audioCtx.resume();
+}, { once: true });
+ 
+// --- NUT TAI FILE ---
+// Tai qua endpoint /download/<ten> de trinh duyet luu file ve may.
+document.getElementById('btnExcel').addEventListener('click', () => {
+  window.location.href = '/download/log.xlsx';
+});
+document.getElementById('btnCsv').addEventListener('click', () => {
+  window.location.href = '/download/log.csv';
+});
+document.getElementById('btnReport').addEventListener('click', () => {
+  window.open('/report', '_blank');
+});
+ 
+// --- O NHAP KHOANG CACH DO THUC NGHIEM ---
+// Ban nhap so met, moi su kien SAU DO se duoc gan khoang cach nay.
+function capNhatHienThiKhoangCach(m) {
+  const el = document.getElementById('distNow');
+  if (m > 0) {
+    el.textContent = 'Đang đặt: ' + m + ' m';
+    el.style.color = '#22c55e';
+  } else {
+    el.textContent = 'Chưa nhập';
+    el.style.color = '#64748b';
+  }
+}
+ 
+document.getElementById('btnSetDist').addEventListener('click', () => {
+  const v = document.getElementById('inpDist').value;
+  fetch('/set_distance?m=' + encodeURIComponent(v))
+    .then(r => r.json())
+    .then(d => {
+      capNhatHienThiKhoangCach(d.m);
+      console.log('Da dat khoang cach:', d.m, 'm');
+    })
+    .catch(e => console.error('Loi dat khoang cach:', e));
+});
+ 
+// Cho phep bam Enter trong o nhap
+document.getElementById('inpDist').addEventListener('keydown', (e) => {
+  if (e.key === 'Enter') {
+    document.getElementById('btnSetDist').click();
+  }
+});
+ 
+// --- NUT CHOT MOC DO ---
+// Ghi 1 dong danh dau vao log/Excel -> tach ro moc khoang cach.
+document.getElementById('btnMarker').addEventListener('click', () => {
+  const v = document.getElementById('inpDist').value;
+  fetch('/marker?m=' + encodeURIComponent(v))
+    .then(r => r.json())
+    .then(d => {
+      capNhatHienThiKhoangCach(d.m);
+      const el = document.getElementById('distNow');
+      el.textContent = 'Đã chốt mốc ' + d.m + ' m';
+      el.style.color = '#a78bfa';
+      // Dong log marker se tu ve qua WebSocket 'event'.
+    })
+    .catch(e => console.error('Loi chot moc:', e));
+});
+ 
+// --- NUT BO QUA MOC ---
+// Danh dau toan bo du lieu cua moc hien tai la "bo qua" -> khong tinh
+// vao hoi quy/phan tich. Dung cho moc test hoac do sai dieu kien.
+// Bam lan 1 -> xac nhan, bam lan 2 -> bo qua that.
+let skipCho = false;
+let skipTimer = null;
+const btnSkip = document.getElementById('btnSkip');
+btnSkip.addEventListener('click', () => {
+  const v = document.getElementById('inpDist').value;
+  if (!v || Number(v) <= 0) {
+    alert('Nhập khoảng cách mốc cần bỏ qua trước.');
+    return;
+  }
+  if (!skipCho) {
+    skipCho = true;
+    btnSkip.classList.add('confirm');
+    btnSkip.textContent = '⚠ Bỏ qua mốc ' + v + ' m?';
+    skipTimer = setTimeout(() => {
+      skipCho = false;
+      btnSkip.classList.remove('confirm');
+      btnSkip.innerHTML = '&#x1F6AB; Bỏ qua mốc';
+    }, 4000);
+    return;
+  }
+  clearTimeout(skipTimer);
+  skipCho = false;
+  btnSkip.classList.remove('confirm');
+  btnSkip.innerHTML = '&#x1F6AB; Bỏ qua mốc';
+  fetch('/skip_marker?m=' + encodeURIComponent(v))
+    .then(r => r.json())
+    .then(d => {
+      const el = document.getElementById('distNow');
+      el.textContent = 'Đã bỏ qua mốc ' + d.m + ' m (' + d.n + ' dòng)';
+      el.style.color = '#f87171';
+      console.log('Bo qua moc:', d);
+    })
+    .catch(e => console.error('Loi bo qua moc:', e));
+});
+ 
+// --- NUT LAM MOI LOG (xoa du lieu dang xem) ---
+// Bam lan 1 -> doi sang trang thai xac nhan; bam lan 2 -> xoa that.
+let resetCho = false;
+let resetTimer = null;
+const btnReset = document.getElementById('btnReset');
+btnReset.addEventListener('click', () => {
+  if (!resetCho) {
+    resetCho = true;
+    btnReset.classList.add('confirm');
+    btnReset.textContent = '⚠ Bấm lần nữa để xác nhận';
+    resetTimer = setTimeout(() => {
+      resetCho = false;
+      btnReset.classList.remove('confirm');
+      btnReset.innerHTML = '&#x1F5D1; Lam moi log';
+    }, 4000);
+    return;
+  }
+  clearTimeout(resetTimer);
+  resetCho = false;
+  btnReset.classList.remove('confirm');
+  btnReset.innerHTML = '&#x1F5D1; Lam moi log';
+  fetch('/reset_log')
+    .then(r => r.json())
+    .then(d => {
+      // Xoa sach giao dien
+      document.getElementById('logList').innerHTML = '';
+      chart.data.labels = [];
+      chart.data.datasets[0].data = [];
+      chart.data.datasets[1].data = [];
+      chart.update('none');
+      capNhatHienThiKhoangCach(0);
+      alert('Đã làm mới log.\nFile cũ được lưu: '
+            + (d.backup && d.backup.length ? d.backup.join(', ') : 'không có'));
+    })
+    .catch(e => console.error('Loi reset log:', e));
+});
+ 
+// Khi mo trang: doc khoang cach hien tai tu server
+fetch('/get_distance')
+  .then(r => r.json())
+  .then(d => {
+    document.getElementById('inpDist').value = d.m;
+    capNhatHienThiKhoangCach(d.m);
+  })
+  .catch(() => {});
+</script>
+</body>
+</html>"""
+ 
+REPORT_HTML = r"""<!DOCTYPE html>
+<html lang="vi">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Phan tich du lieu do - LoRa</title>
+<script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.1/dist/chart.umd.min.js"></script>
+<style>
+  body { margin:0; font-family:'Segoe UI',sans-serif; background:#0f172a; color:#e2e8f0; }
+  .header { background:#1e293b; padding:16px 24px; border-bottom:2px solid #334155;
+    display:flex; align-items:center; gap:16px; }
+  .header h1 { font-size:20px; margin:0; }
+  .header a { color:#38bdf8; text-decoration:none; font-size:14px; }
+  .wrap { padding:20px 24px; max-width:1200px; margin:0 auto; }
+  .sec-title { font-size:16px; color:#94a3b8; margin:24px 0 12px;
+    border-left:3px solid #38bdf8; padding-left:10px; }
+  .cards { display:grid; grid-template-columns:repeat(auto-fit,minmax(180px,1fr));
+    gap:14px; }
+  .card { background:#1e293b; border:1px solid #334155; border-radius:8px;
+    padding:16px; text-align:center; }
+  .card .label { font-size:13px; color:#94a3b8; }
+  .card .val { font-size:28px; font-weight:700; color:#38bdf8; margin:6px 0; }
+  .card .sub { font-size:12px; color:#64748b; }
+  table { width:100%; border-collapse:collapse; background:#1e293b;
+    border-radius:8px; overflow:hidden; font-size:14px; }
+  th { background:#1f4e79; color:#fff; padding:10px; text-align:center; }
+  td { padding:8px 10px; text-align:center; border-bottom:1px solid #334155; }
+  tr:nth-child(even) td { background:#162032; }
+  .chart-box { background:#1e293b; border:1px solid #334155; border-radius:8px;
+    padding:16px; margin-top:14px; }
+  .chart-box h3 { font-size:14px; color:#94a3b8; margin:0 0 10px; }
+  .cbox { position:relative; height:320px; }
+  .note { background:#422006; border:1px solid #f59e0b; border-radius:8px;
+    padding:12px 16px; color:#fbbf24; font-size:13px; margin-top:14px; }
+  .empty { text-align:center; color:#64748b; padding:40px; font-size:15px; }
+  .err { color:#f87171; }
+</style>
+</head>
+<body>
+<div class="header">
+  <h1>&#x1F4CA; Phan tich du lieu do thuc nghiem</h1>
+  <a href="/">&#x2190; Ve dashboard</a>
+</div>
+<div class="wrap" id="wrap">
+  <div class="empty">Dang tai du lieu...</div>
+</div>
+ 
+<script>
+const fmt = (v, n) => (v === null || v === undefined || v === '') ? '-'
+                      : Number(v).toFixed(n);
+ 
+function renderCard(label, val, sub) {
+  return '<div class="card"><div class="label">' + label + '</div>'
+    + '<div class="val">' + val + '</div>'
+    + '<div class="sub">' + (sub || '') + '</div></div>';
+}
+ 
+async function load() {
+  const wrap = document.getElementById('wrap');
+  let d;
+  try {
+    d = await (await fetch('/report_data')).json();
+  } catch (e) {
+    wrap.innerHTML = '<div class="err">Loi tai du lieu: ' + e + '</div>';
+    return;
+  }
+ 
+  if (!d.co_du_lieu) {
+    wrap.innerHTML = '<div class="empty">Chưa có dữ liệu đo.<br>'
+      + 'Hãy nhập khoảng cách, bấm "Chốt mốc" và đo trước '
+      + '(hoặc mở lại dashboard để nạp log.csv).</div>';
+    return;
+  }
+ 
+  let html = '';
+ 
+  // === KHOI HOI QUY (B4) ===
+  html += '<div class="sec-title">1. Thông số mô hình path loss (hồi quy)</div>';
+  if (d.hq && d.hq.ok) {
+    html += '<div class="cards">';
+    html += renderCard('Hệ số A (dB)', fmt(d.hq.A, 2),
+                       'mức tín hiệu gốc');
+    html += renderCard('Hệ số n', fmt(d.hq.n, 2),
+                       'độ dốc suy hao (mô hình cũ: 20)');
+    html += renderCard('Shadowing sigma', fmt(d.hq.sigma, 2) + ' dB',
+                       'độ nhiễu ngẫu nhiên');
+    html += renderCard('R&sup2;', fmt(d.hq.r2, 3), 'độ khớp (càng gần 1 càng tốt)');
+    html += '</div>';
+    html += '<div class="card" style="margin-top:14px;text-align:left">'
+      + '<b>Công thức dùng cho mô phỏng:</b><br>'
+      + '<span style="color:#22c55e;font-size:15px">'
+      + 'RSSI(d) = ' + fmt(d.hq.A, 2) + ' &minus; 10&middot;'
+      + fmt(d.hq.n, 2) + '&middot;log<sub>10</sub>(d)</span></div>';
+ 
+    if (d.hq.moc_kep && d.hq.moc_kep.length) {
+      html += '<div class="note">&#x26A0; Mốc ' + d.hq.moc_kep.join(', ')
+        + ' m nghi bị <b>kẹp sàn RSSI</b> (bộ thu bão hòa ~'
+        + '-127.5 dBm). Nên loại các mốc này khi hồi quy chính thức '
+        + 'hoặc đo lại với nguồn cân bằng.</div>';
+    }
+  } else {
+    html += '<div class="note">Chưa hồi quy được: '
+      + (d.hq ? d.hq.loi : 'không có dữ liệu') + '</div>';
+  }
+ 
+  // === BANG THEO MOC (B1) ===
+  html += '<div class="sec-title">2. Bảng tổng hợp theo mốc khoảng cách</div>';
+  if (d.theo_moc && d.theo_moc.length) {
+    html += '<table><tr><th>Khoảng cách (m)</th><th>Số mẫu</th>'
+      + '<th>RSSI TB (dBm)</th><th>SNR TB (dB)</th><th>Gửi OK</th>'
+      + '<th>Gửi FAIL</th><th>PDR (%)</th><th>Qua repeater</th></tr>';
+    d.theo_moc.forEach(m => {
+      const pdr = m.tx > 0 ? (m.ok / m.tx * 100).toFixed(1) : '-';
+      let pdrColor = '';
+      if (pdr !== '-') pdrColor = pdr >= 95 ? '#22c55e'
+                        : pdr >= 70 ? '#f59e0b' : '#ef4444';
+      html += '<tr>'
+        + '<td><b>' + m.kc + '</b></td>'
+        + '<td>' + m.n_msg + '</td>'
+        + '<td>' + fmt(m.rssi_tb, 1) + '</td>'
+        + '<td>' + fmt(m.snr_tb, 1) + '</td>'
+        + '<td>' + m.ok + '</td>'
+        + '<td>' + m.fail + '</td>'
+        + '<td style="color:' + pdrColor + ';font-weight:700">' + pdr + '</td>'
+        + '<td>' + m.hop1 + '</td>'
+        + '</tr>';
+    });
+    html += '</table>';
+  } else {
+    html += '<div class="note">Chưa có sự kiện nào được gán khoảng cách. '
+      + 'Nhập khoảng cách + Chốt mốc khi đo.</div>';
+  }
+ 
+  // === BIEU DO ===
+  html += '<div class="sec-title">3. Biểu đồ</div>';
+  html += '<div class="chart-box"><h3>RSSI theo khoảng cách '
+    + '(trục log) + đường hồi quy</h3><div class="cbox">'
+    + '<canvas id="c1"></canvas></div></div>';
+  html += '<div class="chart-box"><h3>Số gói nhận theo khoảng RSSI '
+    + '(vùng xám = sắp mất)</h3><div class="cbox">'
+    + '<canvas id="c2"></canvas></div></div>';
+ 
+  wrap.innerHTML = html;
+ 
+  // Ve bieu do 1: RSSI theo log10(d)
+  if (d.bieu_do_rssi && d.bieu_do_rssi.length) {
+    const pts = d.bieu_do_rssi;
+    const lo = Math.min(...pts.map(p => p[0]));
+    const hi = Math.max(...pts.map(p => p[0]));
+    const line = [];
+    for (let i = 0; i <= 20; i++) {
+      const dd = Math.exp(Math.log(lo) + (Math.log(hi) - Math.log(lo)) * i / 20);
+      const r = d.hq && d.hq.ok
+        ? d.hq.A - 10 * d.hq.n * Math.log10(dd) : null;
+      line.push({ x: dd, y: r });
+    }
+    new Chart(document.getElementById('c1'), {
+      type: 'scatter',
+      data: { datasets: [
+        { label: 'Điểm đo (TB mỗi mốc)', data: pts.map(p => ({x:p[0], y:p[1]})),
+          backgroundColor: '#38bdf8', pointRadius: 6 },
+        { label: 'Đường hồi quy', data: line, type: 'line',
+          borderColor: '#22c55e', pointRadius: 0, borderWidth: 2 }
+      ]},
+      options: {
+        responsive: true, maintainAspectRatio: false,
+        scales: {
+          x: { type: 'logarithmic', title: { display:true, text:'Khoảng cách (m)',
+               color:'#94a3b8' }, ticks:{ color:'#64748b' } },
+          y: { title: { display:true, text:'RSSI (dBm)', color:'#94a3b8' },
+               ticks:{ color:'#64748b' } }
+        },
+        plugins: { legend: { labels: { color:'#cbd5e1' } } }
+      }
+    });
+  }
+ 
+  // Ve bieu do 2: so goi theo bin RSSI
+  if (d.bieu_do_hist && d.bieu_do_hist.length) {
+    new Chart(document.getElementById('c2'), {
+      type: 'bar',
+      data: { labels: d.bieu_do_hist.map(b => b[0] + '..' + b[1]),
+        datasets: [{ label: 'Số gói nhận', data: d.bieu_do_hist.map(b => b[2]),
+          backgroundColor: d.bieu_do_hist.map(b =>
+            b[0] > -120 ? '#22c55e' : (b[1] >= -127 ? '#f59e0b' : '#ef4444')) }] },
+      options: {
+        responsive: true, maintainAspectRatio: false,
+        scales: { x: { title:{display:true,text:'Khoảng RSSI (dBm)',color:'#94a3b8'},
+                       ticks:{color:'#64748b'} },
+                  y: { title:{display:true,text:'Số gói',color:'#94a3b8'},
+                       ticks:{color:'#64748b'} } },
+        plugins: { legend: { labels: { color:'#cbd5e1' } } }
+      }
+    });
+  }
+}
+load();
+</script>
+</body>
+</html>"""
+ 
+from flask import Flask, render_template_string
+from flask_socketio import SocketIO
+ 
+app = Flask(__name__)
+app.config["SECRET_KEY"] = "lora-dashboard-secret"
+socketio = SocketIO(app, cors_allowed_origins="*", async_mode="threading")
+ 
+parser = LogParser(lambda event, data: socketio.emit(event, data))
+ 
+@app.route("/report")
+def report():
+    return render_template_string(REPORT_HTML)
+ 
+@app.route("/report_data")
+def report_data():
+    from flask import jsonify
+ 
+    theo_moc_raw, _ = tach_du_lieu_do()
+ 
+    theo_moc = []
+    bieu_do_rssi = []
+    for k in sorted(theo_moc_raw):
+        d = theo_moc_raw[k]
+        rssi_tb = (sum(d["rssi"]) / len(d["rssi"])) if d["rssi"] else None
+        snr_tb = (sum(d["snr"]) / len(d["snr"])) if d["snr"] else None
+        theo_moc.append({
+            "kc": k, "n_msg": d["n_msg"], "tx": d["tx"], "ok": d["ok"],
+            "fail": d["fail"], "hop1": d["hop1"],
+            "rssi_tb": rssi_tb, "snr_tb": snr_tb,
+        })
+        if rssi_tb is not None:
+            bieu_do_rssi.append((k, round(rssi_tb, 1)))
+ 
+    hq = hoi_quy_path_loss()
+    bieu_do_hist = thong_ke_pdr_theo_rssi(bin_db=3)
+ 
+    return jsonify({
+        "co_du_lieu": len(nhat_ky.rows) > 0,
+        "hq": hq,
+        "theo_moc": theo_moc,
+        "bieu_do_rssi": bieu_do_rssi,
+        "bieu_do_hist": bieu_do_hist,
+    })
+ 
+@app.route("/")
+def index():
+    return render_template_string(DASHBOARD_HTML)
+ 
+@app.route("/get_distance")
+def get_distance():
+    from flask import jsonify
+    return jsonify({"m": khoang_cach_hien_tai()})
+ 
+@app.route("/set_distance")
+def set_distance():
+    from flask import jsonify, request
+    m = request.args.get("m", "0")
+    v = dat_khoang_cach(m)
+    print("  [KHOANG CACH] Da dat: %d m  (moi su kien tu gio se ghi %d m)"
+          % (v, v))
+    return jsonify({"m": v})
+ 
+@app.route("/marker")
+def marker():
+    from flask import jsonify, request
+    m = request.args.get("m", "")
+    try:
+        so = int(float(m))
+    except (TypeError, ValueError):
+        so = khoang_cach_hien_tai()
+ 
+    dat_khoang_cach(so)
+    ts = datetime.datetime.now().strftime("%H:%M:%S")
+    parser._dispatch({
+        "type": "marker",
+        "text": str(so),
+        "src": "",
+    }, ts)
+    print("  [MOC DO] Da chot moc %d m (ghi 1 dong danh dau vao log)" % so)
+    return jsonify({"m": so})
+ 
+@app.route("/skip_marker")
+def skip_marker():
+    from flask import jsonify, request
+    m = request.args.get("m", "")
+    bat = request.args.get("bat", "1")
+    try:
+        moc = int(float(m))
+    except (TypeError, ValueError):
+        return jsonify({"ok": False, "loi": "Thieu tham so m"})
+ 
+    danh_dau = "x" if bat not in ("0", "false", "False") else ""
+    n = 0
+    for r in nhat_ky.rows:
+        kc = r.get("khoang_cach")
+        if kc in ("", None):
+            continue
+        try:
+            if int(float(kc)) == moc:
+                r["bo_qua"] = danh_dau
+                n += 1
+        except (TypeError, ValueError):
+            continue
+ 
+    _ghi_lai_toan_bo()
+    trang_thai = "BO QUA" if danh_dau else "BO danh dau"
+    print("  [BO QUA] Moc %d m: %s %d dong" % (moc, trang_thai, n))
+    return jsonify({"ok": True, "m": moc, "n": n, "bo_qua": bool(danh_dau)})
+ 
+@app.route("/reset_log")
+def reset_log():
+    import os
+    from flask import jsonify
+    tem = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+    da_doi = []
+    for f in (CSV_FILE, "log.xlsx"):
+        if os.path.isfile(f):
+            moi = f.replace(".", "_cu_%s." % tem)
+            try:
+                os.rename(f, moi)
+                da_doi.append(os.path.basename(moi))
+            except OSError as e:
+                print("  [!] Khong doi ten duoc %s: %s" % (f, e))
+ 
+    nhat_ky.rows = []
+    nhat_ky.stt = 0
+    with state.lock:
+        state.logs.clear()
+        state.chart_data.clear()
+        state.n_rx = state.n_tx_ok = state.n_tx_fail = 0
+        state.n_alarm = state.n_alarm_tx = state.n_clear = 0
+        state.last_rssi = state.last_snr = state.last_rtt = None
+        state.alarm_active = False
+        state.alarm_src = None
+        state.seq_nguon = {}
+        state.n_lost = 0
+        state.n_expected = 0
+ 
+    csv_writer._chuan_bi_file()
+    xlsx_writer.write(force=True)
+    print("  [RESET] Da lam moi log. File cu luu tai: %s"
+          % (", ".join(da_doi) if da_doi else "(khong co file cu)"))
+    return jsonify({"ok": True, "backup": da_doi})
+ 
+@app.route("/download/<ten_file>")
+def download(ten_file):
+    import os
+    from flask import send_file, abort
+    cho_phep = {
+        "log.xlsx": "application/vnd.openxmlformats-officedocument"
+                    ".spreadsheetml.sheet",
+        "log.csv": "text/csv",
+    }
+    if ten_file not in cho_phep:
+        abort(404)
+    duong_dan = os.path.abspath(ten_file)
+    if not os.path.isfile(duong_dan):
+        abort(404, "Chua co file %s. Hay chay chuong trinh mot lat de tao du lieu."
+                   % ten_file)
+    return send_file(duong_dan, as_attachment=True,
+                     download_name=ten_file, mimetype=cho_phep[ten_file])
+ 
+@socketio.on("connect")
+def on_connect():
+    with state.lock:
+        snapshot = {
+            "n_rx": state.n_rx,
+            "n_tx_ok": state.n_tx_ok,
+            "n_tx_fail": state.n_tx_fail,
+            "n_alarm": state.n_alarm,
+            "n_alarm_tx": state.n_alarm_tx,
+            "n_clear": state.n_clear,
+            "last_rssi": state.last_rssi,
+            "last_snr": state.last_snr,
+            "last_rtt": state.last_rtt,
+            "alarm_active": state.alarm_active,
+            "alarm_src": state.alarm_src,
+            "n_lost": state.n_lost,
+            "n_expected": state.n_expected,
+            "pdr": tinh_pdr(),
+            "sf": state.cfg_sf,
+            "bw": state.cfg_bw,
+            "freq": state.cfg_freq,
+            "rep": state.cfg_rep,
+            "logs": list(state.logs),
+            "chart_data": list(state.chart_data),
+        }
+    socketio.emit("snapshot", snapshot)
+ 
+def serial_reader(port):
+    import serial
+    try:
+        ser = serial.Serial(port, BAUDRATE, timeout=1)
+        print(f"  Da mo {port} @ {BAUDRATE} baud")
+    except serial.SerialException as e:
+        print(f"  [!] Khong mo duoc {port}: {e}")
+        return
+ 
+    while True:
+        try:
+            line = ser.readline().decode("utf-8", errors="replace")
+            if line:
+                parser.feed(line)
+        except Exception as e:
+            print(f"  [!] Loi doc Serial: {e}")
+            time.sleep(1)
+ 
+def find_port():
+    try:
+        import serial.tools.list_ports
+    except ImportError:
+        print("  [!] Chua cai pyserial: pip install pyserial")
+        return None
+ 
+    ports = serial.tools.list_ports.comports()
+    if not ports:
+        return None
+ 
+    for p in ports:
+        desc = (p.description or "").lower()
+        if "nrf" in desc or "adafruit" in desc:
+            return p.device
+ 
+    generic = [p for p in ports
+               if "usb serial device" in (p.description or "").lower()]
+    if len(generic) == 1 and len(ports) == 1:
+        print(f"  [i] Nhan dang '{generic[0].description}' (nRF SuperMini)")
+        return generic[0].device
+ 
+    print("  Cac cong COM hien co:")
+    for p in ports:
+        print(f"    {p.device}  -  {p.description}")
+    return None
+ 
+DEMO_LINES = [
+    "==========================================",
+    "  LORA TERMINAL  ID='B'  (v6 co SOS)",
+    "==========================================",
+    "[OK] SX1262 KHOI TAO THANH CONG!",
+    "[READY] Dang lang nghe...",
+    "",
+    "******************************************",
+    '[RX #1] "chao ban A"',
+    "  src=A  hop=0  seq=41",
+    "  RSSI: -55.0 dBm | SNR: 11.0 dB",
+    "******************************************",
+    "",
+    "******************************************",
+    '[RX #2] "co chay o khu vuc dong!"',
+    "  src=A  hop=0  seq=42",
+    "  RSSI: -72.0 dBm | SNR: 8.0 dB",
+    "******************************************",
+    "",
+    "##########################################",
+    "#  [CANH BAO] NHAN BAO DONG TU NODE A  #  RSSI -72.0 dBm | SNR 8.0 dB",
+    "#  Node khac dang bao chay. Kiem tra khu vuc!",
+    "##########################################",
+    "",
+    "[SOS] Node A DA HUY bao dong.",
+    "",
+    "******************************************",
+    '[RX #3] "da so tan an toan"',
+    "  src=A  hop=0  seq=43",
+    "  RSSI: -60.0 dBm | SNR: 10.0 dB",
+    "******************************************",
+    "",
+    "----------------------------------------",
+    '[TX #1] GUI: "ro~i, toi van on"',
+    "----------------------------------------",
+    "-> [OK] ACK, RTT 3350 ms",
+    "",
+    "----------------------------------------",
+    '[TX #2] GUI: "thu lai nhe"',
+    "----------------------------------------",
+    "-> [FAIL] khong nhan duoc ACK",
+    "",
+ 
+    "##########################################",
+    "#  [SOS] NODE B KICH HOAT BAO DONG  #",
+    "##########################################",
+    "[SOS] Phat bao dong lan 1 seq=44",
+    "",
+ 
+    "##########################################",
+    "#  [SOS] NODE B DA HUY BAO DONG  #",
+    "##########################################",
+]
+ 
+def demo_reader():
+    print("  [DEMO] Gia lap log node B...")
+    for line in DEMO_LINES:
+        parser.feed(line)
+        time.sleep(0.8)
+    print("  [DEMO] Het du lieu mau. Dashboard van chay, cho tin that.")
+ 
+    while True:
+        time.sleep(1)
+ 
+def alarm_watchdog():
+    ALARM_HOLD = 45.0
+    import time as _t
+    while True:
+        _t.sleep(1.0)
+        with state.lock:
+            if state.alarm_active and state.alarm_ts is not None:
+                age = (datetime.datetime.now() - state.alarm_ts).total_seconds()
+                if age > ALARM_HOLD:
+                    state.alarm_active = False
+                    state.alarm_src = None
+                    print("  [WATCHDOG] Het 45s khong nghe goi alarm -> tu tat canh bao web")
+ 
+                    socketio.emit("event", {
+                        "log": {
+                            "ts": datetime.datetime.now().strftime("%H:%M:%S"),
+                            "type": "clear",
+                            "src": "watchdog",
+                            "text": "",
+                            "rssi": "", "snr": "",
+                            "hop": "", "seq": "", "rtt_ms": "",
+                        },
+                        "stats": {
+                            "n_rx": state.n_rx,
+                            "n_tx_ok": state.n_tx_ok,
+                            "n_tx_fail": state.n_tx_fail,
+                            "n_alarm": state.n_alarm,
+                            "n_alarm_tx": state.n_alarm_tx,
+                            "n_clear": state.n_clear,
+                            "last_rssi": state.last_rssi,
+                            "last_snr": state.last_snr,
+                            "last_rtt": state.last_rtt,
+                            "alarm_active": False,
+                            "alarm_src": None,
+                        },
+                    })
+ 
+if __name__ == "__main__":
+    print("=" * 60)
+    print("  LORA WEB DASHBOARD")
+    print("=" * 60)
+ 
+    kc_cu = nap_khoang_cach()
+    if kc_cu > 0:
+        print("  [KHOANG CACH] Nap lai tu %s: %d m  (moi su kien moi van ghi %d m)"
+              % (KC_FILE, kc_cu, kc_cu))
+    else:
+        print("  [KHOANG CACH] Chua co gia tri luu truoc.")
+ 
+    nap_lich_su()
+ 
+    if "--demo" in sys.argv:
+        print("  Che do DEMO (khong can mach)")
+        t = threading.Thread(target=demo_reader, daemon=True)
+        t.start()
+    else:
+        port = find_port()
+        if port is None:
+            print("\n  [!] Khong tim thay board.")
+            print("      Kiem tra: day USB cam chua? Serial Monitor da dong?")
+            print("      Thu: python web_server.py --demo  (test khong can mach)")
+            sys.exit(1)
+        print(f"  Tim thay board tai: {port}")
+        t = threading.Thread(target=serial_reader, args=(port,), daemon=True)
+        t.start()
+ 
+    print(f"\n  Mo trinh duyet: http://localhost:{PORT}")
+    print(f"  Nhan Ctrl+C de thoat.\n")
+    print("  Nhat ky duoc ghi dong thoi 2 dinh dang:")
+    print("    - log.csv   (CSV, mo bang Excel/Notepad deu duoc)")
+    print("    - log.xlsx  (Excel dep: 3 sheet Nhat ky / Tong hop / Chat luong)")
+    print()
+ 
+    wd = threading.Thread(target=alarm_watchdog, daemon=True)
+    wd.start()
+ 
+    try:
+        socketio.run(app, host=HOST, port=PORT, debug=False, use_reloader=False)
+    except RuntimeError:
+ 
+        print("  [i] Fallback sang Flask dev server (long-polling)")
+        app.run(host=HOST, port=PORT, debug=False, threaded=True)
